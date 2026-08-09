@@ -20,7 +20,7 @@ python-telegram-bot==21.5
 # Social Media APIs
 tweepy==4.14.0
 requests==2.32.0
-requests-oauthlib==2.0.0
+requests-oauthlib>=1.2.0,<2
 
 # Security
 cryptography==43.0.0
