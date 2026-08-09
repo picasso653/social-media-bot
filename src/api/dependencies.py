@@ -4,17 +4,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.config import settings
 
-connect_args: dict = {}
-if settings.database_url.startswith("postgresql+asyncpg"):
-    connect_args["prepared_statement_cache_size"] = 0
-
 engine = create_async_engine(
     settings.database_url,
     echo=settings.app_debug,
     future=True,
-    connect_args=connect_args,
-    pool_size=5,
+    pool_size=3,
     max_overflow=2,
+    pool_pre_ping=True,
+    connect_args={
+        "prepared_statement_cache_size": 0,
+    },
 )
 async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
