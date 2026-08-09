@@ -101,6 +101,7 @@ class TelegramService:
         if not settings.telegram_webhook_url:
             return
         app = self.get_application()
+        await app.initialize()
         await app.bot.set_webhook(url=settings.telegram_webhook_url)
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
