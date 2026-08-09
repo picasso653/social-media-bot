@@ -1,10 +1,13 @@
+import contextlib
 import json
 import logging
 from typing import Optional
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+from src.api.dependencies import async_session_factory
 from src.config import settings
 from src.platforms.registry import PlatformRegistry
 from src.services.auth_service import AuthService
@@ -24,6 +27,18 @@ PLATFORM_TAGS = {
 VALID_PLATFORMS = {"x", "tiktok", "instagram"}
 
 
+@contextlib.asynccontextmanager
+async def _db_services():
+    session = async_session_factory()
+    auth_svc = AuthService(session=session)
+    post_svc = PostService(session=session, auth_service=auth_svc)
+    try:
+        yield session, auth_svc, post_svc
+        await session.commit()
+    finally:
+        await session.close()
+
+
 def extract_platforms_from_text(text: str) -> list[str]:
     found: set[str] = set()
     lower_text = text.lower()
@@ -34,8 +49,7 @@ def extract_platforms_from_text(text: str) -> list[str]:
 
 
 def remove_platform_tags(text: str) -> str:
-    result = text
-    parts = result.split()
+    parts = text.split()
     filtered = [p for p in parts if p.lower() not in PLATFORM_TAGS]
     return " ".join(filtered).strip()
 
@@ -54,8 +68,6 @@ class TelegramService:
             return
         self._initialized = True
         self.application: Optional[Application] = None
-        self.post_service = PostService()
-        self.auth_service = AuthService()
 
     def get_application(self) -> Application:
         if self.application is None:
@@ -64,7 +76,7 @@ class TelegramService:
 
     def _build_application(self) -> Application:
         if not settings.telegram_bot_token:
-            raise ValueError("TELEGRAM_BOT_TOKEN is not set. Cannot build Telegram application.")
+            raise ValueError("TELEGRAM_BOT_TOKEN is not set.")
 
         app = Application.builder().token(settings.telegram_bot_token).build()
 
@@ -87,18 +99,9 @@ class TelegramService:
 
     async def set_webhook(self) -> None:
         if not settings.telegram_webhook_url:
-            logger.warning("TELEGRAM_WEBHOOK_URL not set. Skipping webhook registration.")
             return
         app = self.get_application()
         await app.bot.set_webhook(url=settings.telegram_webhook_url)
-
-    async def start_polling(self) -> None:
-        app = self.get_application()
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-
-    # ── Command Handlers ──────────────────────────────────────
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = [
@@ -128,13 +131,13 @@ class TelegramService:
             "📋 *Available Commands*\n\n"
             "/start — Welcome message\n"
             "/help — This list\n"
-            "/connect `<platform>` — Link a social account (`x`, `tiktok`, `instagram`)\n"
+            "/connect `<platform>` — Link a social account\n"
             "/disconnect `<platform>` — Unlink an account\n"
             "/status — See which accounts are connected\n"
             "/history — Your last 10 posts\n\n"
             "*Posting*\n"
-            "Just send text or a photo to post to all connected accounts.\n"
-            "Add `#x` `#tiktok` `#ig` in your message to select specific platforms.",
+            "Just send text or a photo to post.\n"
+            "Add `#x` `#tiktok` `#ig` to select platforms.",
             parse_mode="Markdown",
         )
 
@@ -163,7 +166,8 @@ class TelegramService:
             return
 
         telegram_id = update.effective_user.id
-        auth_url = await self.auth_service.start_oauth(platform, telegram_id)
+        async with _db_services() as (session, auth_svc, post_svc):
+            auth_url = await auth_svc.start_oauth(platform, telegram_id)
 
         await update.message.reply_text(
             f"🔗 *Connect {platform.upper()}*\n\n"
@@ -176,22 +180,17 @@ class TelegramService:
     async def _handle_disconnect(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         args = context.args
         if not args:
-            await update.message.reply_text(
-                "Usage: `/disconnect <platform>`\nExample: `/disconnect x`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text("Usage: `/disconnect <platform>`\nExample: `/disconnect x`", parse_mode="Markdown")
             return
 
         platform = args[0].lower()
         if platform not in VALID_PLATFORMS:
-            await update.message.reply_text(
-                f"❌ Unknown platform: `{platform}`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text(f"❌ Unknown platform: `{platform}`", parse_mode="Markdown")
             return
 
         telegram_id = update.effective_user.id
-        success = await self.auth_service.disconnect_platform(str(telegram_id), platform)
+        async with _db_services() as (session, auth_svc, post_svc):
+            success = await auth_svc.disconnect_platform(str(telegram_id), platform)
 
         if success:
             await update.message.reply_text(f"✅ Disconnected from {platform.upper()}")
@@ -200,7 +199,8 @@ class TelegramService:
 
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         telegram_id = update.effective_user.id
-        platforms = await self.auth_service.get_connected_platforms(str(telegram_id))
+        async with _db_services() as (session, auth_svc, post_svc):
+            platforms = await auth_svc.get_connected_platforms(str(telegram_id))
 
         if not platforms:
             await update.message.reply_text(
@@ -214,15 +214,12 @@ class TelegramService:
             lines.append(f"  ✅ {display_name}")
 
         keyboard = [[InlineKeyboardButton("➕ Connect Another", callback_data="connect_menu")]]
-        await update.message.reply_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     async def _handle_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         telegram_id = update.effective_user.id
-        history = await self.post_service.get_user_history(str(telegram_id), limit=10)
+        async with _db_services() as (session, auth_svc, post_svc):
+            history = await post_svc.get_user_history(str(telegram_id), limit=10)
 
         if not history:
             await update.message.reply_text("📝 *Post History*\n\nNo posts yet. Send something!")
@@ -238,12 +235,9 @@ class TelegramService:
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    # ── Message Handlers ──────────────────────────────────────
-
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         telegram_id = update.effective_user.id
         text = update.message.text.strip()
-        username = update.effective_user.username
 
         platforms = extract_platforms_from_text(text)
         clean_text = remove_platform_tags(text)
@@ -254,19 +248,19 @@ class TelegramService:
 
         await update.message.reply_text("⏳ Processing your post...")
 
-        result = await self.post_service.create_post(
-            user_id=str(telegram_id),
-            content=clean_text,
-            media=None,
-            platforms=platforms if platforms else None,
-        )
+        async with _db_services() as (session, auth_svc, post_svc):
+            result = await post_svc.create_post(
+                user_id=str(telegram_id),
+                content=clean_text,
+                media=None,
+                platforms=platforms if platforms else None,
+            )
 
         await update.message.reply_text(self._format_post_result(result))
 
     async def _handle_photo_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         telegram_id = update.effective_user.id
         caption = update.message.caption or ""
-        username = update.effective_user.username
 
         platforms = extract_platforms_from_text(caption)
         clean_caption = remove_platform_tags(caption)
@@ -277,16 +271,15 @@ class TelegramService:
 
         await update.message.reply_text("⏳ Uploading and posting your photo...")
 
-        result = await self.post_service.create_post(
-            user_id=str(telegram_id),
-            content=clean_caption,
-            media=bytes(image_bytes),
-            platforms=platforms if platforms else None,
-        )
+        async with _db_services() as (session, auth_svc, post_svc):
+            result = await post_svc.create_post(
+                user_id=str(telegram_id),
+                content=clean_caption,
+                media=bytes(image_bytes),
+                platforms=platforms if platforms else None,
+            )
 
         await update.message.reply_text(self._format_post_result(result))
-
-    # ── Callback Handlers ─────────────────────────────────────
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -299,7 +292,8 @@ class TelegramService:
             await query.message.reply_text("Send me text or a photo and I'll post it for you!")
 
         elif data == "status":
-            platforms = await self.auth_service.get_connected_platforms(str(telegram_id))
+            async with _db_services() as (session, auth_svc, post_svc):
+                platforms = await auth_svc.get_connected_platforms(str(telegram_id))
             if platforms:
                 await query.edit_message_text(
                     "📊 *Account Status*\n\n" + "\n".join(f"  ✅ {p}" for p in platforms),
@@ -309,9 +303,7 @@ class TelegramService:
                 await query.edit_message_text("No accounts connected yet. Use /connect to get started.")
 
         elif data == "help":
-            await query.message.reply_text(
-                "📋 Use /help for available commands.\nSend text or photos to post.",
-            )
+            await query.message.reply_text("📋 Use /help for available commands.\nSend text or photos to post.")
 
         elif data == "connect_menu":
             keyboard = [
@@ -325,7 +317,8 @@ class TelegramService:
 
         elif data.startswith("connect_"):
             platform = data.replace("connect_", "")
-            auth_url = await self.auth_service.start_oauth(platform, telegram_id)
+            async with _db_services() as (session, auth_svc, post_svc):
+                auth_url = await auth_svc.start_oauth(platform, telegram_id)
             await query.edit_message_text(
                 f"🔗 *Connect {platform.upper()}*\n\n"
                 f"[Click here to authorize]({auth_url})\n\n"
@@ -336,13 +329,12 @@ class TelegramService:
 
         elif data.startswith("disconnect_"):
             platform = data.replace("disconnect_", "")
-            success = await self.auth_service.disconnect_platform(str(telegram_id), platform)
+            async with _db_services() as (session, auth_svc, post_svc):
+                success = await auth_svc.disconnect_platform(str(telegram_id), platform)
             if success:
                 await query.edit_message_text(f"✅ Disconnected from {platform.upper()}")
             else:
                 await query.edit_message_text(f"❌ Could not disconnect {platform.upper()}")
-
-    # ── Helpers ───────────────────────────────────────────────
 
     def _format_post_result(self, result: dict) -> str:
         status = result.get("status", "unknown")
@@ -352,27 +344,22 @@ class TelegramService:
         if status == "no_accounts":
             return (
                 "❌ *No accounts connected!*\n\n"
-                "Use /connect to link your social media accounts first.\n"
-                "Available: `x`, `tiktok`, `instagram`"
+                "Use /connect to link your social media accounts first."
             )
 
         lines = ["📊 *Post Results*\n"]
-
         for platform in all_platforms:
             pr = platform_results.get(platform, {})
             display = pr.get("display_name", platform.upper())
             success = pr.get("success", False)
             error = pr.get("error", "")
-
             if success:
                 lines.append(f"  ✅ *{display}* — Posted!")
             else:
-                reason = error or "Not yet implemented"
-                lines.append(f"  ❌ *{display}* — {reason}")
+                lines.append(f"  ❌ *{display}* — {error or 'Unknown error'}")
 
         if not all_platforms:
             lines.append("  ⚠️ No platforms were targeted.")
-
         return "\n".join(lines)
 
 

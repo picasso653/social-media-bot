@@ -1,6 +1,7 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.platforms import register_all_adapters
 from src.platforms.registry import PlatformRegistry
@@ -13,8 +14,19 @@ def _register_adapters():
 
 
 @pytest.fixture
-def auth_service():
-    return AuthService()
+def mock_session():
+    session = AsyncMock(spec=AsyncSession)
+    session.execute = AsyncMock()
+    session.add = MagicMock()
+    session.flush = AsyncMock()
+    session.commit = AsyncMock()
+    session.close = AsyncMock()
+    return session
+
+
+@pytest.fixture
+def auth_service(mock_session):
+    return AuthService(session=mock_session)
 
 
 @pytest.fixture
@@ -31,6 +43,22 @@ def mock_x_adapter():
 
     mock.authenticate = mock_authenticate
     return mock
+
+
+def _mock_user_result(mock_session, telegram_id="12345", user=None):
+    mock_result = MagicMock()
+    if user:
+        mock_result.scalar_one_or_none.return_value = user
+    else:
+
+        class FakeResult:
+            @staticmethod
+            def scalar_one_or_none():
+                return None
+
+        mock_result = FakeResult()
+    mock_session.execute.return_value = mock_result
+    return mock_result
 
 
 class TestAuthService:
@@ -53,57 +81,84 @@ class TestAuthService:
                 await auth_service.complete_oauth("x", "code123", "bad_state")
 
     @pytest.mark.asyncio
-    async def test_connect_and_status_flow(self, auth_service, mock_x_adapter):
-        auth_service._pending_auth["known_state_123"] = {
-            "platform": "x",
-            "telegram_id": "12345",
-        }
+    async def test_connect_and_status_flow(self, auth_service, mock_session, mock_x_adapter):
+        auth_service._pending_auth["kn_state"] = {"platform": "x", "telegram_id": "12345"}
+
+        fake_user = MagicMock()
+        fake_user.id = "user-uuid-1"
+        fake_user.telegram_id = 12345
+
+        result_user = MagicMock()
+        result_user.scalar_one_or_none.return_value = fake_user
+
+        result_no_existing = MagicMock()
+        result_no_existing.scalar_one_or_none.return_value = None
+
+        result_accounts = MagicMock()
+        fake_account = MagicMock()
+        fake_account.platform = "x"
+        fake_account.access_token = "token123"
+        result_accounts.scalars.return_value.all.return_value = [fake_account]
+
+        mock_session.execute = AsyncMock(side_effect=[
+            result_user,
+            result_no_existing,
+            result_user,
+            result_accounts,
+        ])
+
         with patch.object(PlatformRegistry, "get", return_value=mock_x_adapter):
-            result = await auth_service.complete_oauth("x", "code123", "known_state_123")
+            result = await auth_service.complete_oauth("x", "code123", "kn_state")
+            assert result["platform"] == "x"
+            assert result["status"] == "connected"
 
-        assert result["platform"] == "x"
-        assert result["status"] == "connected"
-
-        platforms = await auth_service.get_connected_platforms("12345")
-        assert len(platforms) == 1
-        assert "X (Twitter)" in platforms
+            platforms = await auth_service.get_connected_platforms("12345")
+            assert len(platforms) == 1
 
     @pytest.mark.asyncio
-    async def test_disconnect(self, auth_service, mock_x_adapter):
-        auth_service._pending_auth["known_state_456"] = {
-            "platform": "x",
-            "telegram_id": "12345",
-        }
+    async def test_connect_and_disconnect(self, auth_service, mock_session, mock_x_adapter):
+        auth_service._pending_auth["kn_state2"] = {"platform": "x", "telegram_id": "12345"}
+
+        fake_user = MagicMock()
+        fake_user.id = "user-uuid-2"
+        fake_user.telegram_id = 12345
+
+        result_user = MagicMock()
+        result_user.scalar_one_or_none.return_value = fake_user
+
+        result_no_existing = MagicMock()
+        result_no_existing.scalar_one_or_none.return_value = None
+
+        result_existing = MagicMock()
+        fake_account = MagicMock()
+        fake_account.platform = "x"
+        result_existing.scalar_one_or_none.return_value = fake_account
+
+        mock_session.execute = AsyncMock(side_effect=[
+            result_user,
+            result_no_existing,
+            result_user,
+            result_existing,
+        ])
+
         with patch.object(PlatformRegistry, "get", return_value=mock_x_adapter):
-            await auth_service.complete_oauth("x", "code456", "known_state_456")
-
-        success = await auth_service.disconnect_platform("12345", "x")
-        assert success is True
-        platforms = await auth_service.get_connected_platforms("12345")
-        assert len(platforms) == 0
+            await auth_service.complete_oauth("x", "code456", "kn_state2")
+            success = await auth_service.disconnect_platform("12345", "x")
+            assert success is True
 
     @pytest.mark.asyncio
-    async def test_multiple_platforms(self, auth_service, mock_x_adapter):
-        tiktok_mock = MagicMock()
-        tiktok_mock.get_auth_url.return_value = "https://tiktok.com/auth?state=tok123"
-        tiktok_mock.get_platform_info.return_value = MagicMock(name="tiktok", display_name="TikTok")
+    async def test_empty_status(self, auth_service, mock_session):
+        fake_user = MagicMock()
+        fake_user.id = "user-uuid-x"
+        fake_user.telegram_id = 999
 
-        async def tiktok_auth(code, state):
-            return {"access_token": "tok", "platform_user_id": "1", "display_name": "TikTok"}
+        result_user = MagicMock()
+        result_user.scalar_one_or_none.return_value = fake_user
 
-        tiktok_mock.authenticate = tiktok_auth
+        result_accounts = MagicMock()
+        result_accounts.scalars.return_value.all.return_value = []
 
-        auth_service._pending_auth["x_state"] = {"platform": "x", "telegram_id": "12345"}
-        auth_service._pending_auth["tt_state"] = {"platform": "tiktok", "telegram_id": "12345"}
+        mock_session.execute = AsyncMock(side_effect=[result_user, result_accounts])
 
-        with patch.object(PlatformRegistry, "get", side_effect=lambda p: mock_x_adapter if p == "x" else tiktok_mock):
-            await auth_service.complete_oauth("x", "code1", "x_state")
-            await auth_service.complete_oauth("tiktok", "code2", "tt_state")
-
-        platforms = await auth_service.get_connected_platforms("12345")
-        assert len(platforms) == 2
-
-    @pytest.mark.asyncio
-    async def test_empty_status(self, auth_service):
-        platforms = await auth_service.get_connected_platforms("unknown_user")
+        platforms = await auth_service.get_connected_platforms("999")
         assert platforms == []

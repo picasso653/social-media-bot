@@ -4,8 +4,10 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.dependencies import engine
 from src.api.routes import telegram, auth, posts
 from src.config import settings
+from src.models import Base
 from src.platforms import register_all_adapters
 from src.services.telegram_service import telegram_service
 
@@ -14,7 +16,10 @@ from src.services.telegram_service import telegram_service
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     register_all_adapters()
 
-    if settings.telegram_bot_token and settings.app_env == "development":
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    if settings.telegram_bot_token and settings.telegram_webhook_url:
         try:
             await telegram_service.set_webhook()
         except Exception:
@@ -24,6 +29,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     if telegram_service.application:
         await telegram_service.application.shutdown()
+    await engine.dispose()
 
 
 app = FastAPI(

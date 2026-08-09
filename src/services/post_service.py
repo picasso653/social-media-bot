@@ -1,5 +1,10 @@
 import logging
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.models.post import Post
+from src.models.post_platform import PostPlatform
 from src.platforms.registry import PlatformRegistry
 from src.services.auth_service import AuthService
 
@@ -7,8 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class PostService:
-    def __init__(self):
-        self.auth_service = AuthService()
+    def __init__(self, session: AsyncSession | None = None, auth_service: AuthService | None = None):
+        self._session = session
+        self.auth_service = auth_service or AuthService(session=session)
 
     async def create_post(
         self,
@@ -55,7 +61,7 @@ class PostService:
                 }
                 continue
 
-            token = await self._get_token_for_platform(user_id, platform_name)
+            token = await self.auth_service.get_token_for_platform(user_id, platform_name)
             if token is None:
                 platform_results[platform_name] = {
                     "display_name": info.display_name,
@@ -86,7 +92,7 @@ class PostService:
                 platform_results[platform_name] = {
                     "display_name": info.display_name,
                     "success": False,
-                    "error": "Adapter not yet implemented (coming in Phase 3-5)",
+                    "error": "Adapter error — check logs",
                 }
 
         posted_count = sum(1 for r in platform_results.values() if r.get("success"))
@@ -98,13 +104,6 @@ class PostService:
             "platform_results": platform_results,
             "posted_count": posted_count,
         }
-
-    async def _get_token_for_platform(self, telegram_id: str, platform: str) -> str | None:
-        accounts = self.auth_service._connected_accounts.get(telegram_id, [])
-        for account in accounts:
-            if account["platform"] == platform:
-                return account.get("access_token")
-        return None
 
     async def get_user_history(self, user_id: str, limit: int = 10) -> list[dict]:
         return []

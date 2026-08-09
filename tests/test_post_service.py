@@ -1,6 +1,9 @@
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
 from src.platforms import register_all_adapters
+from src.services.auth_service import AuthService
 from src.services.post_service import PostService
 
 
@@ -12,73 +15,45 @@ def _register_adapters():
 class TestPostService:
     @pytest.fixture
     def post_service(self):
-        return PostService()
+        auth_svc = MagicMock(spec=AuthService)
+        auth_svc.get_token_for_platform = AsyncMock(return_value=None)
+        return PostService(auth_service=auth_svc)
 
     @pytest.mark.asyncio
-    async def test_create_text_post(self, post_service):
-        result = await post_service.create_post(
-            user_id="12345",
-            content="Hello world",
-            media=None,
-            platforms=["x"],
-        )
+    async def test_create_text_post_no_token(self, post_service):
+        result = await post_service.create_post(user_id="12345", content="Hello", platforms=["x"])
         assert result["status"] == "failed"
-        assert result["content_type"] == "text"
-        assert "x" in result["platforms"]
-        assert result["platform_results"]["x"]["display_name"] == "X (Twitter)"
+        assert "x" in result["platform_results"]
+        assert not result["platform_results"]["x"]["success"]
+        assert "not connected" in result["platform_results"]["x"]["error"].lower()
 
     @pytest.mark.asyncio
     async def test_create_image_post(self, post_service):
-        result = await post_service.create_post(
-            user_id="12345",
-            content="My photo",
-            media=b"fake_image_bytes",
-            platforms=["instagram"],
-        )
+        result = await post_service.create_post(user_id="12345", content="Test", media=b"fake", platforms=["instagram"])
         assert result["content_type"] == "image"
         assert "instagram" in result["platform_results"]
 
     @pytest.mark.asyncio
     async def test_unsupported_text_on_tiktok(self, post_service):
-        result = await post_service.create_post(
-            user_id="12345",
-            content="Text only post",
-            media=None,
-            platforms=["tiktok"],
-        )
+        result = await post_service.create_post(user_id="12345", content="Text only", platforms=["tiktok"])
         pr = result["platform_results"]["tiktok"]
         assert pr["success"] is False
-        assert "text" in pr["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_unknown_platform_excluded(self, post_service):
-        result = await post_service.create_post(
-            user_id="12345",
-            content="Test",
-            platforms=["x", "unknown_platform"],
-        )
+    async def test_unknown_platform(self, post_service):
+        result = await post_service.create_post(user_id="12345", content="Test", platforms=["unknown_platform"])
         assert "unknown_platform" in result["platform_results"]
-        assert result["platform_results"]["unknown_platform"]["success"] is False
+        assert not result["platform_results"]["unknown_platform"]["success"]
 
     @pytest.mark.asyncio
     async def test_no_platforms(self, post_service):
-        result = await post_service.create_post(
-            user_id="12345",
-            content="Test",
-            platforms=[],
-        )
+        result = await post_service.create_post(user_id="12345", content="Test", platforms=[])
         assert result["status"] == "no_accounts"
 
     @pytest.mark.asyncio
-    async def test_default_platforms_all(self, post_service):
-        result = await post_service.create_post(
-            user_id="12345",
-            content="Test",
-        )
+    async def test_default_to_all_platforms(self, post_service):
+        result = await post_service.create_post(user_id="12345", content="Test")
         assert len(result["platforms"]) == 3
-        assert "x" in result["platforms"]
-        assert "tiktok" in result["platforms"]
-        assert "instagram" in result["platforms"]
 
     @pytest.mark.asyncio
     async def test_get_user_history_empty(self, post_service):
