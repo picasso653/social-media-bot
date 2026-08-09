@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.config import settings
 
-connect_args = {}
+connect_args: dict = {}
 if settings.database_url.startswith("postgresql+asyncpg"):
     connect_args["prepared_statement_cache_size"] = 0
 
@@ -12,7 +12,7 @@ engine = create_async_engine(
     settings.database_url,
     echo=settings.app_debug,
     future=True,
-    connect_args=connect_args if connect_args else None,
+    connect_args=connect_args,
     pool_size=5,
     max_overflow=2,
 )
